@@ -25,11 +25,45 @@
   <div class="row"><strong>測試</strong><strong>預期</strong><strong>實際</strong><strong>結果</strong></div>
   <main id="results"></main>
   <script type="module">
-    import { EXEC_URL } from './config.local.js';
     import { runCorsMatrix } from './cors-matrix.js';
     document.querySelector('#user-agent').textContent = navigator.userAgent;
     document.querySelector('#origin').textContent = location.origin;
-    const result = await runCorsMatrix(EXEC_URL);
+
+    // exec URL 的來源依序嘗試：
+    //   1. ?exec=<url> 查詢參數 —— Pages 上唯一可行的方式，因為
+    //      spike/**/config.local.js 被 .gitignore 排除，不會部署上去。
+    //   2. ./config.local.js —— 本機直接開檔時使用。
+    //   3. 都沒有 → 顯示說明，不要讓畫面空白。
+    // exec URL 依 §12 是**公開值**（前端本來就知道它），不是 secret。
+    async function resolveExecUrl() {
+      const fromQuery = new URLSearchParams(location.search).get('exec');
+      if (fromQuery) return fromQuery.trim();
+      try {
+        const module = await import('./config.local.js');
+        return module.EXEC_URL;
+      } catch {
+        return null;
+      }
+    }
+
+    function isValidExecUrl(value) {
+      try {
+        const url = new URL(value);
+        return url.protocol === 'https:' &&
+          url.hostname === 'script.google.com' &&
+          url.pathname.endsWith('/exec');
+      } catch { return false; }
+    }
+
+    const execUrl = await resolveExecUrl();
+    if (!isValidExecUrl(execUrl)) {
+      document.querySelector('#summary').textContent = execUrl
+        ? `exec URL 無效：${execUrl}　必須是 https://script.google.com/macros/s/<ID>/exec`
+        : '缺少 exec URL。請在網址後加上 ?exec=https://script.google.com/macros/s/<ID>/exec';
+      throw new Error('missing or invalid exec url');
+    }
+
+    const result = await runCorsMatrix(execUrl);
     const host = document.querySelector('#results');
     result.tests.forEach((test) => {
       const row = document.createElement('div');
