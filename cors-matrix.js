@@ -1,5 +1,6 @@
 const UTF8 = new TextEncoder();
 const PATH_SUFFIX = '/student/tasks/T0001/submit';
+const ROUTE_PATH = 'student/tasks/T0001/submit';
 
 function requestId() { return crypto.randomUUID(); }
 function joinUrl(base, suffix = '') { return `${base.replace(/\/$/, '')}${suffix}`; }
@@ -11,10 +12,31 @@ async function sha256(text) {
 function result(id, expected, passed, actual, status = passed ? 'PASS' : 'FAIL') {
   return { id, expected, actual, status };
 }
+// GAS 的 /exec 會 302 導向一次性的 googleusercontent.com URL，密集呼叫時該重導不穩定，
+// 會回 HTML 錯誤頁（`<!DOCTYPE`）或把請求降級成無 body 的 GET。Node 端的 client.mjs
+// 早就有 3 次重試，瀏覽器端卻沒有 —— 2026-08-13 的 T6 就是這樣被判 FAIL 的。
+// 兩邊條件必須對等，否則測到的是「有沒有重試」而不是「機制成不成立」。
+const MAX_ATTEMPTS = 3;
+const RETRY_BASE_MS = 800;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function fetchJson(url, options) {
-  const response = await fetch(url, options);
-  const text = await response.text();
-  return { response, json: JSON.parse(text) };
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+      const text = await response.text();
+      try {
+        return { response, json: JSON.parse(text) };
+      } catch {
+        lastError = new Error(`回傳非 JSON（HTTP ${response.status}）：${text.slice(0, 80)}`);
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < MAX_ATTEMPTS) await sleep(RETRY_BASE_MS * attempt);
+  }
+  throw lastError;
 }
 function postBody(payload) { return JSON.stringify({ probe: 'echo', request_id: requestId(), payload }); }
 async function postEcho(execUrl, payload, suffix = '', contentType = 'text/plain;charset=utf-8', headers = {}) {
@@ -60,12 +82,33 @@ async function testT4(execUrl) {
     return result('T4', '兩次 server_nonce 必須不同', ok, `${one.json.server_nonce} / ${two.json.server_nonce}`);
   } catch (error) { return result('T4', '兩次 server_nonce 必須不同', false, `${error.name}: ${error.message}`); }
 }
+// T5 已於 2026-08-13 改寫。原本測 `/exec/<path>` 的 e.pathInfo 路由，但實測
+// 任何路徑後綴一律回 HTTP 401 + Google 登入頁（Node 端交叉驗證同樣結果，
+// 排除 CORS 因素）→ ADR-01 改為把路由放進 body 的 `path` 欄位（偏離登記 D-11）。
+//
+// 因此 T5 現在驗證兩件事：
+//   (a) 路徑後綴確實不可用 —— 這是**預期失敗**，固定住這個已知限制，
+//       避免日後有人再把 URL 路徑加回去；
+//   (b) 裸 /exec + body 帶 path 可正常往返。
 async function testT5(execUrl) {
+  let suffixRejected = false;
   try {
-    const { json } = await postEcho(execUrl, { sentinel: 'path' }, PATH_SUFFIX);
-    const ok = json.data.path_info === 'student/tasks/T0001/submit';
-    return result('T5', 'path_info 為 student/tasks/T0001/submit', ok, json.data.path_info || '(空)');
-  } catch (error) { return result('T5', 'pathInfo 正確路由', false, `${error.name}: ${error.message}`); }
+    await postEcho(execUrl, { sentinel: 'path' }, PATH_SUFFIX);
+  } catch {
+    suffixRejected = true;
+  }
+
+  try {
+    const { json } = await postEcho(execUrl, { sentinel: 'path', path: ROUTE_PATH });
+    const bodyRoundTripped = json.data.handler_confirmed === 'doPost';
+    const ok = suffixRejected && bodyRoundTripped;
+    return result(
+      'T5', 'URL 路徑後綴被拒；裸 /exec + body 路由可用', ok,
+      `suffixRejected=${suffixRejected}; bodyRoundTrip=${bodyRoundTripped}`);
+  } catch (error) {
+    return result('T5', 'URL 路徑後綴被拒；裸 /exec + body 路由可用', false,
+      `${error.name}: ${error.message}`);
+  }
 }
 async function testT6(execUrl) {
   try {
